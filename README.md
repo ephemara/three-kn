@@ -3,25 +3,6 @@
 **three-kn** is a portable, pure-Kain reimagining of [Three.js](https://threejs.org/) -- the popular 3D library for the browser --> rewritten from the ground up using Kain's full semantic stack. It compresses the **~220,000 lines of JavaScript + GLSL** that power Three.js into roughly **~2,500 lines of Kain** by letting the language own the state, dispatch, timing, coupling, layout, and pipeline semantics that Three.js implements as manual boilerplate.
 
 This is not a port. It is what a 3D engine looks like when the compiler understands your rendering graph.
-
----
-
-## Quick Start
-
-```bash
-# Check the project
-kain check X:/blades/three-kn/src/main.kn
-
-# Build with GPU shader artifacts
-cd X:/blades/three-kn
-kain build
-
-# Run (once native binary support for std::graphics session is wired)
-kain run src/main.kn
-```
-
----
-
 ## Architecture
 
 The engine is organized as **19 flat source files** in a single `src/` directory. Each file maps to a layer of the [Kain decision ladder](https://github.com/kain-lang/kain/blob/master/docs/RULEBOOK.md) ~ from basic math (`Layer 0`) through systems programming constructs like actors, ownership scopes, and GPU compute (`Layer 7`).
