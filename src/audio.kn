@@ -1,0 +1,172 @@
+// ============================================================================
+//  AUDIO — Audio Listener + Player
+//  Layer 1 (world AudioListenerState + entangle),
+//  Layer 7 (actor AudioPlayer)
+// ============================================================================
+//
+//  NOTE: The GPU FFT compute shader is in src/compute.kn.
+//  CameraState (for entangle) is defined in src/control.kn.
+//  Cross-module references resolve at build time via module roots.
+// ============================================================================
+
+use std::actor
+use std::runtime
+use std::math
+
+// ============================================================================
+//  WORLD — AudioListenerState
+// ============================================================================
+
+component AudioPanel():
+    render <panel title="audio">
+        <text value="Audio Listener State" />
+    </panel>
+
+world AudioListenerState:
+    state position: Vec3 = vec3(0.0, 0.0, 0.0)
+    state forward: Vec3 = vec3(0.0, 0.0, -1.0)
+    state up: Vec3 = vec3(0.0, 1.0, 0.0)
+    state master_volume: Float = 1.0
+    state speed_of_sound: Float = 343.0
+    state doppler_factor: Float = 1.0
+    state muted: Bool = false
+    state context_state: Int = 0
+    state epoch: Int = 0
+    surface native_ui => AudioPanel
+
+// ============================================================================
+//  ENTANGLE — Camera -> Audio Listener Auto-Follow
+//  CameraState is defined in control.kn. Resolves at build time.
+// ============================================================================
+
+entangle CameraState.position <-> AudioListenerState.position with single_writer
+entangle CameraState.forward <-> AudioListenerState.forward with single_writer
+entangle CameraState.up <-> AudioListenerState.up with single_writer
+
+// ============================================================================
+//  LAW — Invariant Predicates
+// ============================================================================
+
+law volume_valid(state: AudioListenerState) -> Bool:
+    return state.master_volume >= 0.0 and state.master_volume <= 1.0
+
+law forward_normalized(state: AudioListenerState) -> Bool:
+    let len_sq: Float = vec3_dot(state.forward, state.forward)
+    return len_sq >= 0.99 and len_sq <= 1.01
+
+law up_normalized(state: AudioListenerState) -> Bool:
+    let len_sq: Float = vec3_dot(state.up, state.up)
+    return len_sq >= 0.99 and len_sq <= 1.01
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+
+fn audio_pack_state(is_playing: Bool, is_paused: Bool, position: Int) -> Int with Pure:
+    var result: Int = 0
+    if is_playing: result = result + 1
+    if is_paused: result = result + 2
+    result = result + position * 65536
+    return result
+
+// ============================================================================
+//  ACTOR — AudioPlayer
+// ============================================================================
+
+actor AudioPlayer:
+    state sample_rate: Int = 44100
+    state channels: Int = 2
+    state length: Int = 0
+    state position_samples: Int = 0
+    state is_playing: Bool = false
+    state is_paused: Bool = false
+    state loop_flag: Bool = false
+    state volume: Float = 1.0
+    state playback_rate: Float = 1.0
+
+    on Play(reply_to: P):
+        if self.length > 0:
+            if self.is_paused == true:
+                self.is_paused = false
+            self.is_playing = true
+            send reply_to.Reply(value = 1)
+        else:
+            send reply_to.Reply(value = 0)
+
+    on Pause(reply_to: P):
+        self.is_playing = false
+        self.is_paused = true
+        send reply_to.Reply(value = 0)
+
+    on Stop(reply_to: P):
+        self.is_playing = false
+        self.is_paused = false
+        self.position_samples = 0
+        send reply_to.Reply(value = 0)
+
+    on Seek(reply_to: P, time_ms: Int):
+        let sample_pos: Int = time_ms * self.sample_rate / 1000
+        if sample_pos < self.length:
+            self.position_samples = sample_pos
+            send reply_to.Reply(value = 1)
+        else:
+            send reply_to.Reply(value = 0)
+
+    on SetBuffer(reply_to: P, new_sample_rate: Int, new_channels: Int, new_length: Int):
+        self.sample_rate = new_sample_rate
+        self.channels = new_channels
+        self.length = new_length
+        self.position_samples = 0
+        send reply_to.Reply(value = 1)
+
+    on SetVolume(reply_to: P, vol_packed: Int):
+        self.volume = vol_packed / 1000.0
+        if self.volume > 1.0: self.volume = 1.0
+        if self.volume < 0.0: self.volume = 0.0
+        send reply_to.Reply(value = 1)
+
+    on GetPlaybackState(reply_to: P):
+        let packed: Int = audio_pack_state(self.is_playing, self.is_paused, self.position_samples)
+        send reply_to.Reply(value = packed)
+
+    on Advance(reply_to: P, samples: Int):
+        if self.is_playing == true and self.is_paused == false:
+            let adv: Int = samples
+            self.position_samples = self.position_samples + adv
+            if self.position_samples >= self.length:
+                if self.loop_flag:
+                    self.position_samples = self.position_samples % self.length
+                else:
+                    self.is_playing = false
+                    self.position_samples = 0
+            send reply_to.Reply(value = self.position_samples)
+        else:
+            send reply_to.Reply(value = self.position_samples)
+
+// ============================================================================
+//  GPU FFT SHADER
+//  The audio_fft compute shader is in src/compute.kn (gpu-artifacts target).
+//  Dispatch: dispatch "audio_fft" [N/256, 1, 1] for FFT size N (power of 2).
+//  Kernel: Cooley-Tukey radix-2 with Hann window, shared memory butterfly.
+// ============================================================================
+
+// ============================================================================
+//  INITIALIZATION
+// ============================================================================
+
+fn init_audio_listener() -> Int:
+    AudioListenerState.position = vec3(0.0, 0.0, 0.0)
+    AudioListenerState.forward = vec3(0.0, 0.0, -1.0)
+    AudioListenerState.up = vec3(0.0, 1.0, 0.0)
+    AudioListenerState.master_volume = 1.0
+    AudioListenerState.speed_of_sound = 343.0
+    AudioListenerState.doppler_factor = 1.0
+    AudioListenerState.muted = false
+    AudioListenerState.context_state = 0
+    AudioListenerState.epoch = 1
+    return 0
+
+fn spawn_audio_player() -> Int:
+    let player_id: Int = actor_spawn("audio-player", "{\"volume\":1.0}")
+    let _reg: Int = actor_registry_register("audio-player", player_id)
+    return player_id

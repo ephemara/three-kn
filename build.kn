@@ -1,0 +1,40 @@
+// ============================================================================
+//  BUILD — Project Authority for Three-KN (LLVM + GPU Core Only)
+// ============================================================================
+
+use std::build
+
+fn build(ctx: BuildContext) -> BuildGraph:
+    let album = project("three-kn")
+        .kind("kain_executable")
+        .version("0.1.0")
+        .description("Portable Kain-native 3D Rendering Engine")
+        .entry("src/main.kn")
+        .source_roots(["src"])
+        .module_roots(["src"])
+        .artifact_root(".kain/out")
+        .cache_root(".kain/cache/build")
+
+    let sources = source_set("three-kn-sources")
+        .root("src")
+        .glob("src/**/*.kn")
+
+    // Isolated GPU suite — stripped the .requires() constraint entirely
+    let gpu = gpu_suite("gpu-artifacts")
+        .compute("src/compute.kn")
+        .targets("spirv", "hlsl")
+        .artifact_root(".kain/out/gpu")
+
+    // Native executable task — explicitly hooks into the GPU artifacts
+    let exe = native_executable("root-executable")
+        .project(album)
+        .entry("src/main.kn") 
+        .output("$blade/three-kn.exe")
+        .requires(gpu)
+
+    let lib = native_library("three")
+       .output("$blade/three.dll")
+
+    return build_graph(album)
+        .sources(sources)
+        .tasks(gpu, exe)

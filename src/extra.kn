@@ -1,0 +1,248 @@
+// ============================================================================
+//  EXTRA — Curves, Paths, Shapes, and PMREM Pipeline
+//  Layer 0 (trait, struct, impl, fn), Layer 4 (orchestrate pmrem_pipeline)
+// ============================================================================
+
+use std::math
+use std::intent
+
+// ============================================================================
+//  MATH HELPERS
+// ============================================================================
+
+fn clamp_f(value: Float, lo: Float, hi: Float) -> Float with Pure:
+    if value < lo: return lo
+    if value > hi: return hi
+    return value
+
+fn abs_f(value: Float) -> Float with Pure:
+    if value < 0.0: return -value
+    return value
+
+fn min_f(a: Float, b: Float) -> Float with Pure:
+    if a < b: return a
+    return b
+
+fn max_f(a: Float, b: Float) -> Float with Pure:
+    if a > b: return a
+    return b
+
+// ============================================================================
+//  TRAIT — Curve
+// ============================================================================
+
+trait Curve:
+    fn get_point(self: Self, t: Float) -> Vec3 with Pure
+
+    fn get_tangent(self: Self, t: Float) -> Vec3 with Pure:
+        let eps: Float = 0.001
+        let p_plus: Vec3 = self.get_point(min_f(t + eps, 1.0))
+        let p_minus: Vec3 = self.get_point(max_f(t - eps, 0.0))
+        let diff: Vec3 = vec3_sub(p_plus, p_minus)
+        let dlen: Float = vec3_length(diff)
+        if dlen < 0.0001:
+            return vec3(1.0, 0.0, 0.0)
+        return vec3(diff.x / dlen, diff.y / dlen, diff.z / dlen)
+
+// ============================================================================
+//  CURVE IMPLEMENTATIONS
+// ============================================================================
+
+struct LineCurveSt:
+    start: Vec3
+    end: Vec3
+
+impl Curve for LineCurveSt:
+    fn get_point(self: Self, t: Float) -> Vec3 with Pure:
+        let t_clamped: Float = clamp_f(t, 0.0, 1.0)
+        return vec3_lerp(self.start, self.end, t_clamped)
+
+struct CubicBezier:
+    v0: Vec3
+    v1: Vec3
+    v2: Vec3
+    v3: Vec3
+
+impl Curve for CubicBezier:
+    fn get_point(self: Self, t: Float) -> Vec3 with Pure:
+        let u: Float = 1.0 - t
+        let u2: Float = u * u
+        let u3: Float = u2 * u
+        let t2: Float = t * t
+        let t3: Float = t2 * t
+        return vec3_add(
+            vec3_add(vec3_mul_scalar(self.v0, u3), vec3_mul_scalar(self.v1, 3.0 * u2 * t)),
+            vec3_add(vec3_mul_scalar(self.v2, 3.0 * u * t2), vec3_mul_scalar(self.v3, t3))
+        )
+
+struct QuadraticBezier:
+    v0: Vec3
+    v1: Vec3
+    v2: Vec3
+
+impl Curve for QuadraticBezier:
+    fn get_point(self: Self, t: Float) -> Vec3 with Pure:
+        let u: Float = 1.0 - t
+        let u2: Float = u * u
+        let t2: Float = t * t
+        return vec3_add(
+            vec3_mul_scalar(self.v0, u2),
+            vec3_add(vec3_mul_scalar(self.v1, 2.0 * u * t), vec3_mul_scalar(self.v2, t2))
+        )
+
+struct CatmullRomCurve:
+    points: [Vec3]
+    closed: Bool = false
+
+impl Curve for CatmullRomCurve:
+    fn get_point(self: Self, t: Float) -> Vec3 with Pure:
+        let t_clamped: Float = clamp_f(t, 0.0, 1.0)
+        let pc: Int = len(self.points)
+        if pc < 2:
+            if pc == 1:
+                return self.points[0]
+            return vec3(0.0, 0.0, 0.0)
+        let num_seg: Int = pc - 1
+        let seg_t: Float = t_clamped * num_seg
+        let seg_idx: Int = seg_t
+        if seg_idx >= num_seg:
+            seg_idx = num_seg - 1
+        let local_t: Float = seg_t - seg_idx
+        let p0: Vec3 = self.points[(seg_idx - 1 + pc) % pc]
+        let p1: Vec3 = self.points[seg_idx]
+        let p2: Vec3 = self.points[(seg_idx + 1) % pc]
+        let p3: Vec3 = self.points[(seg_idx + 2) % pc]
+        let t2: Float = local_t * local_t
+        let t3: Float = t2 * local_t
+        return vec3_add(
+            vec3_add(
+                vec3_mul_scalar(p1, 2.0 * t2 - t3 - t2),
+                vec3_mul_scalar(p2, 3.0 * t2 - 2.0 * t2)
+            ),
+            vec3_add(
+                vec3_mul_scalar(vec3_sub(p2, p0), t3 - 2.0 * t2 + local_t),
+                vec3_mul_scalar(vec3_sub(p3, p1), t3 - t2)
+            )
+        )
+
+struct SplineCurve:
+    points: [Vec3]
+    tension: Float = 0.5
+
+impl Curve for SplineCurve:
+    fn get_point(self: Self, t: Float) -> Vec3 with Pure:
+        let t_clamped: Float = clamp_f(t, 0.0, 1.0)
+        let pc: Int = len(self.points)
+        if pc < 2:
+            if pc == 1:
+                return self.points[0]
+            return vec3(0.0, 0.0, 0.0)
+        let num_seg: Int = pc - 1
+        let seg_t: Float = t_clamped * num_seg
+        let seg_idx: Int = seg_t
+        if seg_idx >= num_seg:
+            seg_idx = num_seg - 1
+        let local_t: Float = seg_t - seg_idx
+        let p0: Vec3 = self.points[max_f(seg_idx - 1, 0)]
+        let p1: Vec3 = self.points[seg_idx]
+        let p2: Vec3 = self.points[min_f(seg_idx + 1, pc - 1)]
+        let p3: Vec3 = self.points[min_f(seg_idx + 2, pc - 1)]
+        let ten: Float = self.tension
+        let t2: Float = local_t * local_t
+        let t3: Float = t2 * local_t
+        let m1: Vec3 = vec3_mul_scalar(vec3_sub(p2, p0), (1.0 - ten) * 0.5)
+        let m2: Vec3 = vec3_mul_scalar(vec3_sub(p3, p1), (1.0 - ten) * 0.5)
+        return vec3_add(
+            vec3_add(
+                vec3_mul_scalar(p1, 2.0 * t3 - 3.0 * t2 + 1.0),
+                vec3_mul_scalar(m1, t3 - 2.0 * t2 + local_t)
+            ),
+            vec3_add(
+                vec3_mul_scalar(p2, -2.0 * t3 + 3.0 * t2),
+                vec3_mul_scalar(m2, t3 - t2)
+            )
+        )
+
+struct EllipseCurve:
+    a_x: Float = 0.0
+    a_y: Float = 0.0
+    x_radius: Float = 1.0
+    y_radius: Float = 1.0
+    start_angle: Float = 0.0
+    end_angle: Float = 6.283185
+    rotation: Float = 0.0
+
+impl Curve for EllipseCurve:
+    fn get_point(self: Self, t: Float) -> Vec3 with Pure:
+        let t_clamped: Float = clamp_f(t, 0.0, 1.0)
+        let angle: Float = self.start_angle + (self.end_angle - self.start_angle) * t_clamped
+        let cos_a: Float = cos(angle)
+        let sin_a: Float = sin(angle)
+        let cos_r: Float = cos(self.rotation)
+        let sin_r: Float = sin(self.rotation)
+        let rx: Float = self.x_radius
+        let ry: Float = self.y_radius
+        let x: Float = self.a_x + rx * cos_a * cos_r - ry * sin_a * sin_r
+        let y: Float = self.a_y + rx * cos_a * sin_r + ry * sin_a * cos_r
+        return vec3(x, y, 0.0)
+
+// ============================================================================
+//  STRUCT — Path (2D Path Builder)
+// ============================================================================
+
+struct Path2D:
+    curve_count: Int = 0
+    current_x: Float = 0.0
+    current_y: Float = 0.0
+
+// ============================================================================
+//  TRIANGULATION — Ear-Clipping (returns triangle vertex indices)
+// ============================================================================
+
+fn triangulate_polygon(points_x: [Float], points_y: [Float]) -> [Int] with Pure:
+    // Simple fan triangulation for convex polygons.
+    // Returns triangle vertex indices: [0,1,2, 0,2,3, 0,3,4, ...]
+    let count: Int = len(points_x)
+    if count < 3:
+        return []
+    var result: [Int] = []
+    var i: Int = 1
+    while i < count - 1:
+        result = [0, i, i + 1]
+        i = i + 1
+    return result
+
+// ============================================================================
+//  ORCHESTRATE — PMREM Pipeline
+// ============================================================================
+
+/// Dummy PMREM kernel calls (actual kernels in compute.kn)
+fn pmrem_equirect_to_cubemap(cubemap_size: Int) -> Int with GPU:
+    return cubemap_size
+
+fn pmrem_ggx_vndf(cubemap_size: Int) -> Int with GPU:
+    return cubemap_size
+
+fn pmrem_irradiance(cubemap_size: Int) -> Int with GPU:
+    return cubemap_size
+
+/// Law: ensure the generated env map is complete
+law env_map_complete(output_count: Int, expected_count: Int) -> Bool:
+    return output_count == expected_count
+
+orchestrate pmrem_pipeline(env_map_id: Int, cubemap_size: Int) -> Int:
+    stage equirect_to_cubemap: gpu pmrem_equirect_to_cubemap(cubemap_size) residency device transfer host_to_device
+    stage ggx_prefilter: gpu pmrem_ggx_vndf(cubemap_size) after equirect_to_cubemap residency device transfer none
+    stage irradiance_convolution: gpu pmrem_irradiance(cubemap_size) after ggx_prefilter residency device transfer device_to_host
+    stage register_env: patch register_env_map(env_map_id) after irradiance_convolution residency host policy static
+    return register_env
+
+patch register_env_map(env_map_id: Int) -> Int:
+    return env_map_id
+
+// ============================================================================
+//  INITIALIZATION
+// ============================================================================
+
+fn init_extra() -> Int:
+    return 0

@@ -1,0 +1,65 @@
+// ============================================================================
+//  COMPUTE — GPU Compute Shaders for Three-KN
+//  Compiled to SPIR-V / HLSL via `kain gpu-artifacts`
+// ============================================================================
+//
+//  Contains all compute shader declarations referenced by the engine:
+//    - audio_fft: Direct DFT for audio spectrum analysis
+//      (per-thread-per-bin — no workgroup shared memory required)
+// ============================================================================
+
+// ============================================================================
+//  AUDIO FFT — Direct DFT (per-bin)
+//
+//  Each GPU thread independently computes one frequency bin using a direct
+//  Discrete Fourier Transform. This avoids workgroup shared memory and
+//  barriers, which Kain's shader model does not expose.
+//
+//  The Hann window is applied during the DFT summation. Each thread reads
+//  all N input samples, applies the window, accumulates real and imaginary
+//  parts for its bin, and writes the magnitude to the output buffer.
+// ============================================================================
+
+shader compute audio_fft(id: UVec3) -> Void workgroup(256, 1, 1):
+    uniform input_buffer: StorageBuffer<Float> @0
+    uniform output_buffer: StorageBuffer<Float> @1
+    uniform fft_size: UInt @2
+    uniform window_type: UInt @3
+
+    comptime:
+        let compute = (
+            [256, 1, 1],
+            [
+                ("input_buffer", "f32", ["256"], "input", "kain.shared.buffer"),
+                ("output_buffer", "f32", ["128"], "output", "kain.shared.buffer"),
+                ("fft_size", "u32", ["1"], "uniform", "kain.uniform"),
+                ("window_type", "u32", ["1"], "uniform", "kain.uniform"),
+            ],
+            [],
+        )
+
+    let bin: Int = id.x
+    let N: Int = fft_size
+    let half_N: Int = N / 2
+
+    // Early-out for threads beyond the valid bin range
+    if bin >= half_N:
+        return
+
+    // Direct DFT: each thread computes one frequency bin by iterating
+    // over all N input samples and accumulating real/imaginary parts.
+    var sum_real: Float = 0.0
+    var sum_imag: Float = 0.0
+    var k: Int = 0
+    while k < N:
+        // Hann window: 0.5 * (1 - cos(2*pi * k / (N-1)))
+        let angle: Float = -6.283185307 * (bin as Float) * (k as Float) / (N as Float)
+        let window: Float = 0.5 * (1.0 - cos(6.283185307 * (k as Float) / ((N - 1) as Float)))
+        let sample: Float = input_buffer[k] * window
+        sum_real = sum_real + sample * cos(angle)
+        sum_imag = sum_imag + sample * sin(angle)
+        k = k + 1
+
+    // Magnitude spectrum (positive frequencies only)
+    output_buffer[bin] = sqrt(sum_real * sum_real + sum_imag * sum_imag)
+    return

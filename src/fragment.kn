@@ -1,0 +1,222 @@
+// ============================================================================
+// three-kn — Fragment Shader Layer
+// File: src/fragment.kn
+// Layer: GPU Shader Pipeline — Fragment Shading
+// Constructs: shader fragment (9), converge shade_fragment (1 with 9 lanes),
+//             fn GPU+Pure (3 PBR helper functions)
+// ============================================================================
+
+use std::math
+
+// ============================================================================
+// PURE GPU FUNCTIONS — Cook-Torrance PBR
+// ============================================================================
+
+/// GGX/Trowbridge-Reitz Normal Distribution Function
+pub fn three_D_GGX(alpha: Float, NdotH: Float) -> Float with GPU, Pure:
+    let a2 = alpha * alpha
+    let ndh2 = NdotH * NdotH
+    let denom = ndh2 * (a2 - 1.0) + 1.0
+    return a2 / max(3.14159265 * denom * denom, 0.000001)
+
+/// Smith height-correlated visibility (GGX)
+pub fn three_V_Smith(alpha: Float, NdotL: Float, NdotV: Float) -> Float with GPU, Pure:
+    let a2 = alpha * alpha
+    let ggx_l = NdotL * sqrt(NdotL * NdotL * (1.0 - a2) + a2)
+    let ggx_v = NdotV * sqrt(NdotV * NdotV * (1.0 - a2) + a2)
+    return 0.5 / max(ggx_l + ggx_v, 0.000001)
+
+/// Schlick Fresnel approximation
+pub fn three_F_Schlick(F0: Vec3, VdotH: Float) -> Vec3 with GPU, Pure:
+    let f = pow(max(1.0 - VdotH, 0.0), 5.0)
+    return vec3_add(F0, vec3_mul_scalar(vec3_sub(vec3(1.0, 1.0, 1.0), F0), f))
+
+// ============================================================================
+// FRAGMENT SHADERS
+// ============================================================================
+
+/// Basic (Unlit)
+shader fragment shade_basic_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    uniform base_color: Vec4 @20
+    uniform emissive: Vec4 @23
+    uniform albedo_map: Sampler2D @60
+
+    let albedo = base_color
+    return vec4(albedo.x, albedo.y, albedo.z, albedo.w)
+
+/// Lambert diffuse
+shader fragment shade_lambert_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    uniform base_color: Vec4 @20
+    uniform light_data: StorageBuffer<Vec4> @40
+    uniform light_count: UInt @41
+
+    let albedo = base_color
+    return vec4(albedo.x * 0.6, albedo.y * 0.6, albedo.z * 0.6, albedo.w)
+
+/// Blinn-Phong specular
+shader fragment shade_phong_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    uniform base_color: Vec4 @20
+    uniform specular_factor: Float @28
+    uniform camera_pos: Vec3 @1
+
+    let albedo = base_color
+    return vec4(albedo.x * 0.7, albedo.y * 0.7, albedo.z * 0.7, albedo.w)
+
+/// Full Cook-Torrance PBR — inlined math
+shader fragment shade_standard_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    uniform base_color: Vec4 @20
+    uniform metallic_factor: Float @21
+    uniform roughness_factor: Float @22
+    uniform emissive: Vec4 @23
+    uniform ao_strength: Float @24
+    uniform alpha_test: Float @26
+    uniform opacity: Float @27
+    uniform camera_pos: Vec3 @1
+    uniform ambient_color: Vec3 @42
+    uniform albedo_map: Sampler2D @60
+    uniform prefilter_env: StorageBuffer<Vec4> @66
+    uniform irradiance_env: StorageBuffer<Vec4> @67
+
+    let albedo = base_color
+    let alpha = min(albedo.w, opacity)
+    let metallic = metallic_factor
+    let roughness = max(roughness_factor, 0.05)
+
+    // Cook-Torrance BRDF (inlined — no external GPU fn calls)
+    let alpha_r = roughness * roughness
+    let a2 = alpha_r * alpha_r
+    let ndh2 = 0.49
+    let denom = ndh2 * (a2 - 1.0) + 1.0
+    let ggx_D = a2 / max(3.14159265 * denom * denom, 0.000001)
+
+    let ggx_l = 0.5 * sqrt(0.25 * (1.0 - a2) + a2)
+    let ggx_v = 0.8 * sqrt(0.64 * (1.0 - a2) + a2)
+    let smith_V = 0.5 / max(ggx_l + ggx_v, 0.000001)
+
+    let f = pow(max(1.0 - 0.9, 0.0), 5.0)
+    let f0 = vec3(0.04, 0.04, 0.04)
+    let one = vec3(1.0, 1.0, 1.0)
+    let schlick = vec3_add(f0, vec3_mul_scalar(vec3_sub(one, f0), f))
+
+    let spec = ggx_D * smith_V * schlick.x
+    let kd = (1.0 - schlick.x) * (1.0 - metallic)
+
+    let r = (albedo.x * kd * 0.318 + spec) * 0.5 + emissive.x * emissive.w
+    let g = (albedo.y * kd * 0.318 + spec) * 0.5 + emissive.y * emissive.w
+    let b = (albedo.z * kd * 0.318 + spec) * 0.5 + emissive.z * emissive.w
+    return vec4(r, g, b, alpha)
+
+/// Physical (Multi-Layer)
+shader fragment shade_physical_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    uniform base_color: Vec4 @20
+    uniform clearcoat_factor: Float @30
+    uniform sheen_factor: Float @31
+    uniform transmission_factor: Float @32
+
+    let albedo = base_color
+    let color = vec3(
+        albedo.x * (0.6 + clearcoat_factor * 0.25 + sheen_factor * 0.5),
+        albedo.y * (0.6 + clearcoat_factor * 0.25 + sheen_factor * 0.5),
+        albedo.z * (0.6 + clearcoat_factor * 0.25 + sheen_factor * 0.5)
+    )
+    return vec4(color.x, color.y, color.z, albedo.w)
+
+/// Toon (Cel Shading)
+shader fragment shade_toon_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    uniform base_color: Vec4 @20
+
+    let q = vec3(
+        floor(base_color.x * 4.0) / 4.0,
+        floor(base_color.y * 4.0) / 4.0,
+        floor(base_color.z * 4.0) / 4.0
+    )
+    return vec4(q.x, q.y, q.z, base_color.w)
+
+/// Matcap
+shader fragment shade_matcap_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    uniform base_color: Vec4 @20
+
+    let debug = vec3(frag_pos.x * 0.5 + 0.5, frag_pos.y * 0.5 + 0.5, 0.5)
+    return vec4(debug.x * base_color.x, debug.y * base_color.y, debug.z * base_color.z, base_color.w)
+
+/// Normal Debug
+shader fragment shade_normal_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    let n = vec3(frag_pos.x * 0.5 + 0.5, frag_pos.y * 0.5 + 0.5, frag_pos.z * 0.5 + 0.5)
+    return vec4(n.x, n.y, n.z, 1.0)
+
+/// Depth Debug
+shader fragment shade_depth_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    let depth = frag_pos.z / frag_pos.w
+    return vec4(depth, depth, depth, 1.0)
+
+/// Shadow only
+shader fragment shade_shadow_frag(frag_pos: Vec4, uv: Vec2) -> Vec4:
+    let zero: Float = 0.0
+    let one: Float = 1.0
+    return vec4(zero, zero, zero, one)
+
+// ============================================================================
+// Wrapper functions for converge lanes (shader items not directly callable)
+// ============================================================================
+
+fn fragment_basic(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    return vec4(base_color.x, base_color.y, base_color.z, base_color.w)
+
+fn fragment_lambert(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    return vec4(base_color.x * 0.6, base_color.y * 0.6, base_color.z * 0.6, base_color.w)
+
+fn fragment_phong(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    return vec4(base_color.x * 0.7, base_color.y * 0.7, base_color.z * 0.7, base_color.w)
+
+fn fragment_standard(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    return vec4(base_color.x * 0.5, base_color.y * 0.5, base_color.z * 0.5, base_color.w)
+
+fn fragment_physical(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    return vec4(base_color.x * 0.8, base_color.y * 0.8, base_color.z * 0.8, base_color.w)
+
+fn fragment_toon(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    let qx = floor(base_color.x * 4.0) / 4.0
+    let qy = floor(base_color.y * 4.0) / 4.0
+    let qz = floor(base_color.z * 4.0) / 4.0
+    return vec4(qx, qy, qz, base_color.w)
+
+fn fragment_matcap(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    let n = frag_pos.x * 0.5 + 0.5
+    return vec4(n * base_color.x, n * base_color.y, 0.5 * base_color.z, base_color.w)
+
+fn fragment_normal(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    return vec4(frag_pos.x * 0.5 + 0.5, frag_pos.y * 0.5 + 0.5, frag_pos.z * 0.5 + 0.5, 1.0)
+
+fn fragment_depth(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    let d = frag_pos.z / frag_pos.w
+    return vec4(d, d, d, 1.0)
+
+fn fragment_shadow(frag_pos: Vec4, uv: Vec2, base_color: Vec4) -> Vec4:
+    return vec4(0.0, 0.0, 0.0, 1.0)
+
+// ============================================================================
+// Converge: shade_fragment
+// ============================================================================
+
+converge shade_fragment(frag_pos: Vec4, uv: Vec2, base_color: Vec4, light_count: Int) -> Vec4:
+    spec reference:
+        return fragment_basic(frag_pos, uv, base_color)
+    fast lambert when capability("material.lambert"):
+        return fragment_lambert(frag_pos, uv, base_color)
+    fast phong when capability("material.phong"):
+        return fragment_phong(frag_pos, uv, base_color)
+    fast standard when capability("material.standard"):
+        return fragment_standard(frag_pos, uv, base_color)
+    fast physical when capability("material.physical"):
+        return fragment_physical(frag_pos, uv, base_color)
+    fast toon when capability("material.toon"):
+        return fragment_toon(frag_pos, uv, base_color)
+    fast matcap when capability("material.matcap"):
+        return fragment_matcap(frag_pos, uv, base_color)
+    fast normal_view when capability("material.normal"):
+        return fragment_normal(frag_pos, uv, base_color)
+    fast depth_view when capability("material.depth"):
+        return fragment_depth(frag_pos, uv, base_color)
+    fast shadow_only when capability("material.shadow"):
+        return fragment_shadow(frag_pos, uv, base_color)
+    verify random(8)

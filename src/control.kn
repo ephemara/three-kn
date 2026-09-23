@@ -1,0 +1,364 @@
+// ============================================================================
+//  CONTROL — Camera Control Components
+//  Layer UI (component), Layer 2 (patch camera writes)
+// ============================================================================
+//
+//  NOTE: pulse declarations are top-level only in the current parser.
+//        Inertial damping is handled via pules outside the component
+//        that call methods on the active component instance.
+// ============================================================================
+
+use std::runtime
+use std::math
+
+// ============================================================================
+//  WORLD — CameraState
+// ============================================================================
+
+component CameraPanel():
+    render <panel title="camera">
+        <text value="Camera State" />
+    </panel>
+
+world CameraState:
+    state position: Vec3 = vec3(0.0, 5.0, 15.0)
+    state target: Vec3 = vec3(0.0, 0.0, 0.0)
+    state up: Vec3 = vec3(0.0, 1.0, 0.0)
+    state fov: Float = 75.0
+    state aspect: Float = 16.0 / 9.0
+    state near: Float = 0.1
+    state far: Float = 1000.0
+    state epoch: Int = 0
+    surface native_ui => CameraPanel
+
+patch update_camera_pos(position: Vec3, target: Vec3) -> Int:
+    CameraState.position = position
+    CameraState.target = target
+    CameraState.epoch = CameraState.epoch + 1
+    return CameraState.epoch
+
+patch update_camera_quat(rot: Quat, position: Vec3, target: Vec3) -> Int:
+    CameraState.position = position
+    CameraState.target = target
+    CameraState.epoch = CameraState.epoch + 1
+    return CameraState.epoch
+
+patch update_camera_euler(rot: Quat, position: Vec3) -> Int:
+    CameraState.position = position
+    CameraState.epoch = CameraState.epoch + 1
+    return CameraState.epoch
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+
+fn clamp_f(value: Float, lo: Float, hi: Float) -> Float with Pure:
+    if value < lo: return lo
+    if value > hi: return hi
+    return value
+
+fn abs_f(value: Float) -> Float with Pure:
+    if value < 0.0: return -value
+    return value
+
+fn spherical_to_vec3(s: Vec3) -> Vec3 with Pure:
+    let sin_phi: Float = sin(s.y) * s.z
+    return vec3(sin_phi * sin(s.x), cos(s.y) * s.z, sin_phi * cos(s.x))
+
+// ============================================================================
+//  PULSE — Damping Pulses (top-level, not in components)
+// ============================================================================
+
+/// Shared damping factor for all controls
+var g_control_damping: Float = 0.05
+
+// ============================================================================
+//  COMPONENT — OrbitControls
+// ============================================================================
+
+component OrbitControls(camera: CameraState, target: Vec3, enable_damping: Bool = true, damping_factor: Float = 0.05, min_distance: Float = 0.1, max_distance: Float = 1000.0, min_polar_angle: Float = 0.0, max_polar_angle: Float = 3.14159):
+    state spherical: Vec3 = vec3(0.0, 1.5708, 10.0)
+    state spherical_delta: Vec3 = vec3(0.0, 0.0, 0.0)
+    state rotate_speed: Float = 1.0
+    state zoom_speed: Float = 1.0
+    state is_mouse_down: Bool = false
+    state last_mouse_x: Float = 0.0
+    state last_mouse_y: Float = 0.0
+
+    fn apply_damping(_self: Self_):
+        let dt_scale: Float = 1.0
+        let damp: Float = 1.0 - _self.damping_factor * dt_scale
+        _self.spherical_delta = vec3(_self.spherical_delta.x * damp, _self.spherical_delta.y * damp, _self.spherical_delta.z * damp)
+        _self.spherical = vec3(
+            _self.spherical.x + _self.spherical_delta.x,
+            clamp_f(_self.spherical.y + _self.spherical_delta.y, _self.min_polar_angle, _self.max_polar_angle),
+            clamp_f(_self.spherical.z + _self.spherical_delta.z, _self.min_distance, _self.max_distance)
+        )
+        let pos: Vec3 = spherical_to_vec3(_self.spherical)
+        let cam_pos: Vec3 = vec3_add(pos, _self.target)
+        let _result: Int = update_camera_pos(cam_pos, _self.target)
+        if abs_f(_self.spherical_delta.x) < 0.0001 and abs_f(_self.spherical_delta.y) < 0.0001 and abs_f(_self.spherical_delta.z) < 0.0001:
+            _self.spherical_delta = vec3(0.0, 0.0, 0.0)
+
+    fn polar_angle_clamp(_self: Self_) -> String:
+        return "polar:" + str(_self.spherical.y)
+
+    fn on_mouse_down(_self: Self_, pos_x: Float, pos_y: Float):
+        _self.is_mouse_down = true
+        _self.last_mouse_x = pos_x
+        _self.last_mouse_y = pos_y
+
+    fn on_mouse_move(_self: Self_, pos_x: Float, pos_y: Float):
+        if _self.is_mouse_down:
+            let dx: Float = pos_x - _self.last_mouse_x
+            let dy: Float = pos_y - _self.last_mouse_y
+            _self.spherical_delta = vec3(-dx * _self.rotate_speed * 0.01, -dy * _self.rotate_speed * 0.01, _self.spherical_delta.z)
+            _self.last_mouse_x = pos_x
+            _self.last_mouse_y = pos_y
+
+    fn on_mouse_up(_self: Self_):
+        _self.is_mouse_down = false
+
+    fn on_scroll(_self: Self_, delta: Float):
+        _self.spherical_delta = vec3(_self.spherical_delta.x, _self.spherical_delta.y, -delta * _self.zoom_speed * 0.1)
+
+    render <Fragment>
+        <text value="OrbitControls" />
+    </Fragment>
+
+// ============================================================================
+//  COMPONENT — TrackballControls
+// ============================================================================
+
+component TrackballControls(camera: CameraState, target: Vec3, enable_damping: Bool = true, damping_factor: Float = 0.05, rotate_speed: Float = 1.0, zoom_speed: Float = 1.2, pan_speed: Float = 0.3):
+    state quat: Quat = quat_identity()
+    state position: Vec3 = vec3(0.0, 0.0, 10.0)
+    state pan_offset: Vec3 = vec3(0.0, 0.0, 0.0)
+    state distance: Float = 10.0
+    state is_rotating: Bool = false
+    state is_panning: Bool = false
+    state last_mouse_x: Float = 0.0
+    state last_mouse_y: Float = 0.0
+    state velocity_theta: Float = 0.0
+    state velocity_phi: Float = 0.0
+    state velocity_zoom: Float = 0.0
+
+    fn rotate_arcball(_self: Self_, dx: Float, dy: Float):
+        let eps: Float = 0.001
+        let len: Float = sqrt(dx * dx + dy * dy)
+        if len > eps:
+            let axis: Vec3 = vec3_normalize_or_zero(vec3(dy, dx, 0.0))
+            let angle: Float = len * _self.rotate_speed
+            let delta_quat: Quat = quat_from_axis_angle(axis, angle)
+            _self.quat = quat_mul(delta_quat, _self.quat)
+
+    fn apply_damping(_self: Self_):
+        let damp: Float = 1.0 - _self.damping_factor
+        _self.velocity_theta = _self.velocity_theta * damp
+        _self.velocity_phi = _self.velocity_phi * damp
+        _self.velocity_zoom = _self.velocity_zoom * damp
+        if abs_f(_self.velocity_theta) > 0.0001 or abs_f(_self.velocity_phi) > 0.0001:
+            _self.rotate_arcball(_self.velocity_theta, _self.velocity_phi)
+        _self.distance = clamp_f(_self.distance + _self.velocity_zoom, 0.1, 1000.0)
+        let local_pos: Vec3 = vec3(0.0, 0.0, _self.distance)
+        let world_pos: Vec3 = vec3_add(quat_rotate_vec3(_self.quat, local_pos), _self.pan_offset)
+        let _result: Int = update_camera_quat(_self.quat, world_pos, _self.target)
+
+    fn on_mouse_down(_self: Self_, pos_x: Float, pos_y: Float, button: Int):
+        _self.last_mouse_x = pos_x
+        _self.last_mouse_y = pos_y
+        if button == 0:
+            _self.is_rotating = true
+        if button == 1 or button == 2:
+            _self.is_panning = true
+
+    fn on_mouse_move(_self: Self_, pos_x: Float, pos_y: Float):
+        let dx: Float = pos_x - _self.last_mouse_x
+        let dy: Float = pos_y - _self.last_mouse_y
+        _self.last_mouse_x = pos_x
+        _self.last_mouse_y = pos_y
+        if _self.is_rotating:
+            _self.velocity_theta = dx * 0.01
+            _self.velocity_phi = dy * 0.01
+        if _self.is_panning:
+            let right: Vec3 = vec3(1.0, 0.0, 0.0)
+            let up: Vec3 = vec3(0.0, 1.0, 0.0)
+            _self.pan_offset = vec3_add(_self.pan_offset, vec3_mul_scalar(right, -dx * 0.01 * _self.pan_speed))
+            _self.pan_offset = vec3_add(_self.pan_offset, vec3_mul_scalar(up, dy * 0.01 * _self.pan_speed))
+
+    fn on_mouse_up(_self: Self_):
+        _self.is_rotating = false
+        _self.is_panning = false
+
+    fn on_scroll(_self: Self_, delta: Float):
+        _self.velocity_zoom = -delta * _self.zoom_speed * 0.1
+
+    render <Fragment>
+        <text value="TrackballControls" />
+    </Fragment>
+
+// ============================================================================
+//  COMPONENT — FlyControls
+// ============================================================================
+
+component FlyControls(camera: CameraState, target: Vec3, movement_speed: Float = 10.0, roll_speed: Float = 5.0, look_speed: Float = 0.002):
+    state position: Vec3 = vec3(0.0, 5.0, 10.0)
+    state euler: Vec3 = vec3(0.0, 0.0, 0.0)
+    state move_forward: Bool = false
+    state move_backward: Bool = false
+    state move_left: Bool = false
+    state move_right: Bool = false
+    state move_up: Bool = false
+    state move_down: Bool = false
+    state is_mouse_locked: Bool = false
+
+    fn on_key_down(_self: Self_, key: String):
+        if key == "w" or key == "W": _self.move_forward = true
+        if key == "s" or key == "S": _self.move_backward = true
+        if key == "a" or key == "A": _self.move_left = true
+        if key == "d" or key == "D": _self.move_right = true
+        if key == "q" or key == "Q": _self.move_up = true
+        if key == "e" or key == "E": _self.move_down = true
+
+    fn on_key_up(_self: Self_, key: String):
+        if key == "w" or key == "W": _self.move_forward = false
+        if key == "s" or key == "S": _self.move_backward = false
+        if key == "a" or key == "A": _self.move_left = false
+        if key == "d" or key == "D": _self.move_right = false
+        if key == "q" or key == "Q": _self.move_up = false
+        if key == "e" or key == "E": _self.move_down = false
+
+    fn on_mouse_move(_self: Self_, dx: Float, dy: Float):
+        if _self.is_mouse_locked:
+            _self.euler = vec3(
+                clamp_f(_self.euler.x - dy * _self.look_speed, -1.5708, 1.5708),
+                _self.euler.y - dx * _self.look_speed,
+                _self.euler.z
+            )
+
+    fn apply_movement(_self: Self_):
+        let dt: Float = 1.0
+        let cx: Float = cos(_self.euler.x)
+        let sx: Float = sin(_self.euler.x)
+        let cy: Float = cos(_self.euler.y)
+        let sy: Float = sin(_self.euler.y)
+        let forward: Vec3 = vec3(sy * cx, -sx, cy * cx)
+        let right: Vec3 = vec3(cy, 0.0, -sy)
+        let up: Vec3 = vec3_cross(right, forward)
+        var velocity: Vec3 = vec3(0.0, 0.0, 0.0)
+        if _self.move_forward: velocity = vec3_add(velocity, forward)
+        if _self.move_backward: velocity = vec3_sub(velocity, forward)
+        if _self.move_left: velocity = vec3_sub(velocity, right)
+        if _self.move_right: velocity = vec3_add(velocity, right)
+        if _self.move_up: velocity = vec3_add(velocity, up)
+        if _self.move_down: velocity = vec3_sub(velocity, up)
+        let vlen: Float = vec3_length(velocity)
+        if vlen > 0.0001:
+            let dir: Vec3 = vec3_mul_scalar(velocity, _self.movement_speed / vlen)
+            _self.position = vec3_add(_self.position, vec3_mul_scalar(dir, dt))
+        let quat: Quat = quat_from_axis_angle(vec3(0.0, 1.0, 0.0), _self.euler.y)
+        let _result: Int = update_camera_euler(quat, _self.position)
+
+    render <Fragment>
+        <text value="FlyControls" />
+    </Fragment>
+
+// ============================================================================
+//  COMPONENT — FirstPersonControls
+// ============================================================================
+
+component FirstPersonControls(camera: CameraState, movement_speed: Float = 5.0, look_speed: Float = 0.002, eye_height: Float = 1.7, constrain_pitch: Bool = true):
+    state position: Vec3 = vec3(0.0, 1.7, 10.0)
+    state yaw: Float = 0.0
+    state pitch: Float = 0.0
+    state move_forward: Bool = false
+    state move_backward: Bool = false
+    state move_left: Bool = false
+    state move_right: Bool = false
+    state velocity: Vec3 = vec3(0.0, 0.0, 0.0)
+    state is_pointer_locked: Bool = false
+
+    fn pitch_constrained(_self: Self_) -> String:
+        return "pitch:" + str(_self.pitch)
+
+    fn on_key_down(_self: Self_, key: String):
+        if key == "w" or key == "W": _self.move_forward = true
+        if key == "s" or key == "S": _self.move_backward = true
+        if key == "a" or key == "A": _self.move_left = true
+        if key == "d" or key == "D": _self.move_right = true
+
+    fn on_key_up(_self: Self_, key: String):
+        if key == "w" or key == "W": _self.move_forward = false
+        if key == "s" or key == "S": _self.move_backward = false
+        if key == "a" or key == "A": _self.move_left = false
+        if key == "d" or key == "D": _self.move_right = false
+
+    fn on_mouse_move(_self: Self_, dx: Float, dy: Float):
+        if _self.is_pointer_locked:
+            _self.yaw = _self.yaw - dx * _self.look_speed
+            if _self.constrain_pitch:
+                _self.pitch = clamp_f(_self.pitch - dy * _self.look_speed, -1.5608, 1.5608)
+            else:
+                _self.pitch = _self.pitch - dy * _self.look_speed
+
+    fn apply_fp_tick(_self: Self_):
+        let dt: Float = 1.0
+        let cy: Float = cos(_self.yaw)
+        let sy: Float = sin(_self.yaw)
+        let forward: Vec3 = vec3(sy, 0.0, cy)
+        let right: Vec3 = vec3(cy, 0.0, -sy)
+        if _self.move_forward: _self.velocity = vec3_add(_self.velocity, vec3_mul_scalar(forward, _self.movement_speed * dt))
+        if _self.move_backward: _self.velocity = vec3_sub(_self.velocity, vec3_mul_scalar(forward, _self.movement_speed * dt))
+        if _self.move_left: _self.velocity = vec3_sub(_self.velocity, vec3_mul_scalar(right, _self.movement_speed * dt))
+        if _self.move_right: _self.velocity = vec3_add(_self.velocity, vec3_mul_scalar(right, _self.movement_speed * dt))
+        _self.velocity = vec3_mul_scalar(_self.velocity, 0.9)
+        _self.position = vec3_add(_self.position, _self.velocity)
+        _self.position = vec3(_self.position.x, _self.eye_height, _self.position.z)
+        let rot: Quat = quat_from_axis_angle(vec3(0.0, 1.0, 0.0), _self.yaw)
+        let _result: Int = update_camera_euler(rot, _self.position)
+
+    render <Fragment>
+        <text value="FirstPersonControls" />
+    </Fragment>
+
+// ============================================================================
+//  COMPONENT — PointerLockControls
+// ============================================================================
+
+component PointerLockControls(camera: CameraState, look_speed: Float = 0.002):
+    state locked: Bool = false
+    state yaw: Float = 0.0
+    state pitch: Float = 0.0
+
+    fn request_lock(_self: Self_):
+        _self.locked = true
+
+    fn exit_lock(_self: Self_):
+        _self.locked = false
+
+    fn on_mouse_move(_self: Self_, dx: Float, dy: Float):
+        if _self.locked:
+            _self.yaw = _self.yaw - dx * _self.look_speed
+            _self.pitch = clamp_f(_self.pitch - dy * _self.look_speed, -1.5608, 1.5608)
+
+    fn lock_label(_self: Self_) -> String:
+        if _self.locked:
+            return "Pointer Locked"
+        return "Click to Lock"
+
+    render <text value={lock_label()} />
+
+// ============================================================================
+//  INITIALIZATION
+// ============================================================================
+
+fn init_camera_state() -> Int:
+    CameraState.position = vec3(0.0, 5.0, 15.0)
+    CameraState.target = vec3(0.0, 0.0, 0.0)
+    CameraState.up = vec3(0.0, 1.0, 0.0)
+    CameraState.fov = 75.0
+    CameraState.aspect = 16.0 / 9.0
+    CameraState.near = 0.1
+    CameraState.far = 1000.0
+    CameraState.epoch = 1
+    return 0

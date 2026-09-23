@@ -1,0 +1,146 @@
+// ============================================================================
+//  MAIN — Entry Point & World Wiring
+//  Layer 1 (world init), Layer 5 (pulse frame_clock),
+//  Layer UI (surface dispatch), Layer 7 (actor spawn)
+// ============================================================================
+//
+//  The master controller for the three-kn 3D rendering engine.
+//  Wires ALL layers together.
+//
+//  NOTE: When checking standalone, this file references types/functions
+//  from sibling modules (CameraState, AudioListenerState, select_backend).
+//  These resolve at build time via module roots.
+// ============================================================================
+
+use std::runtime
+use std::graphics
+use std::actor
+use std::math
+
+// ============================================================================
+//  WORLD — Global Engine State (pulse-accessible world storage)
+// ============================================================================
+
+component EnginePanel():
+    render <panel title="three-kn">
+        <text value="Engine State" />
+    </panel>
+
+world EngineState:
+    state render_session: Int = 0
+    state frame_count: Int = 0
+    state running: Bool = false
+    surface native_ui => EnginePanel
+
+// ============================================================================
+//  DEMO SCENE
+// ============================================================================
+
+struct DemoScene:
+    cube_node_id: Int
+    ground_node_id: Int
+    light_node_id: Int
+    camera_id: Int
+
+fn load_demo_scene() -> DemoScene with IO:
+    return DemoScene {
+        cube_node_id: 1,
+        ground_node_id: 2,
+        light_node_id: 3,
+        camera_id: 0
+    }
+
+// ============================================================================
+//  WORLD INITIALIZATION (stub)
+//  NOTE: CameraState/AudioListenerState are in sibling modules.
+//  These calls resolve via module roots when building through build.kn.
+// ============================================================================
+
+fn init_worlds() -> Int:
+    return 0
+
+// ============================================================================
+//  ACTOR SPAWNING
+// ============================================================================
+
+fn spawn_animator() -> Int:
+    let mixer_id: Int = actor_spawn("animation-mixer", "{\"time\":0.0}")
+    let _reg: Int = actor_registry_register("animation-mixer", mixer_id)
+    return mixer_id
+
+fn spawn_audio_player() -> Int:
+    let player_id: Int = actor_spawn("audio-player", "{\"volume\":1.0}")
+    let _reg: Int = actor_registry_register("audio-player", player_id)
+    return player_id
+
+// ============================================================================
+//  RENDER FRAME — pure function, no world writes
+// ============================================================================
+
+fn render_frame(session_id: Int) -> Int:
+    let dt_ms: Float = 16.0
+    let _begin: Int = graphics_begin_frame(session_id, dt_ms)
+    let _end: Int = graphics_end_frame(session_id)
+    let present_status: Int = graphics_present(session_id)
+    return present_status
+
+// ============================================================================
+//  PULSE — Frame Clock (60 FPS render loop)
+// ============================================================================
+
+pulse frame_clock every 16ms jitter 2ms:
+    let dt: Int = pulse_dt_ms
+    if dt < 1:
+        dt = 16
+
+    // Send animation tick to the AnimationMixer actor
+    let mixer_id: Int = actor_registry_lookup("animation-mixer")
+    if mixer_id != actor_invalid_id():
+        let _ack: Int = actor_send(mixer_id, "Update", str(dt))
+
+    // Render a frame using session from EngineState
+    let session: Int = EngineState.render_session
+    if session != 0:
+        let _p: Int = render_frame(session)
+        EngineState.frame_count = EngineState.frame_count + 1
+
+    // Track missed frames for adaptive quality
+    if pulse_missed > 0:
+        let _missed: Int = pulse_missed
+
+// ============================================================================
+//  ENTRY POINT
+// ============================================================================
+
+fn main() -> Int with IO:
+    let init_status: Int = runtime_init()
+    if init_status != 0:
+        return init_status
+
+    // Initialize worlds
+    let _worlds: Int = init_worlds()
+
+    // Create graphics session
+    let session: Int = graphics_session_create("three-kn", 1024, 768)
+    if session == 0:
+        runtime_shutdown()
+        return 1
+    EngineState.render_session = session
+
+    // Spawn actors
+    let _a: Int = spawn_animator()
+    let _b: Int = spawn_audio_player()
+
+    // Load scene
+    let _scene: DemoScene = load_demo_scene()
+
+    // The pulse frame_clock runs automatically.
+    // Main returns — the runtime keeps the process alive
+    // until shutdown because pulses are active.
+
+    // Cleanup
+    let _destroy: Int = graphics_session_destroy(session)
+    EngineState.render_session = 0
+    let _shutdown: Int = runtime_shutdown()
+
+    return 0

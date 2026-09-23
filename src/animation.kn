@@ -1,0 +1,272 @@
+// ============================================================================
+//  ANIMATION — Actor-based Animation System
+//  Layer 7 (actor AnimationMixer), Layer 5 (pulse animation_tick),
+//  Layer 3 (converge interpolate_value), Layer 2 (law, patch)
+// ============================================================================
+
+use std::actor
+use std::runtime
+use std::math
+
+// ============================================================================
+//  ENUMS
+// ============================================================================
+
+enum InterpolationMode:
+    Linear
+    Step
+    CubicSpline
+    QuaternionSlerp
+    Constant
+
+enum TrackPath:
+    Position
+    Rotation
+    Scale
+    Quaternion
+    MorphWeight
+    MaterialProperty
+    BoneProperty
+
+// ============================================================================
+//  DATA STRUCTURES
+// ============================================================================
+
+shatter struct KeyframeData:
+    times: [Float]
+    values: [Float]
+    interpolation_modes: [Int]
+    value_stride: Int
+    track_path: Int
+    count: Int
+    duration: Float
+
+struct KeyframeTrack:
+    target_path: TrackPath
+    key_data: KeyframeData
+    value_size: Int
+
+struct AnimationClip:
+    name: String
+    tracks: [KeyframeTrack]
+    duration: Float
+    loop_mode: Bool
+
+// ============================================================================
+//  WORLD — Animation Action State
+// ============================================================================
+
+component AnimationPanel():
+    render <panel title="animation">
+        <text value="Animation Action State" />
+    </panel>
+
+world AnimationActionState:
+    state clip: AnimationClip = AnimationClip { name: "", tracks: [], duration: 0.0, loop_mode: false }
+    state target_node_id: Int = 0
+    state weight: Float = 1.0
+    state speed: Float = 1.0
+    state playing: Bool = false
+    state paused: Bool = false
+    state fade_in_duration: Float = 0.0
+    state fade_out_duration: Float = 0.0
+    state fade_target_id: Int = 0
+    state epoch: Int = 0
+    surface native_ui => AnimationPanel
+
+// ============================================================================
+//  LAW — Invariant Predicates
+// ============================================================================
+
+law animation_time_valid(state: AnimationActionState) -> Bool:
+    return state.time >= 0.0 and state.time <= state.clip.duration
+
+law animation_weight_valid(state: AnimationActionState) -> Bool:
+    return state.weight >= 0.0 and state.weight <= 1.0
+
+// ============================================================================
+//  PATCH — Journaled Mutations
+// ============================================================================
+
+patch play_action(state: AnimationActionState, speed: Float) -> Int:
+    state.playing = true
+    state.paused = false
+    state.speed = speed
+    state.epoch = state.epoch + 1
+    return state.epoch
+
+patch stop_action(state: AnimationActionState) -> Int:
+    state.playing = false
+    state.paused = false
+    state.weight = 0.0
+    state.epoch = state.epoch + 1
+    return state.epoch
+
+patch crossfade_action(state: AnimationActionState, target_id: Int, duration: Float) -> Int:
+    state.fade_target_id = target_id
+    state.fade_in_duration = duration
+    state.epoch = state.epoch + 1
+    return state.epoch
+
+// ============================================================================
+//  INTERPOLATION FUNCTIONS
+// ============================================================================
+
+fn lerp_scalar(a: Float, b: Float, t: Float) -> Float with Pure:
+    return a + (b - a) * t
+
+fn interpolate_value_linear(track: KeyframeData, time: Float) -> Float with Pure:
+    if track.count < 2:
+        if track.count == 1:
+            return track.values[0]
+        return 0.0
+    var key_a: Int = 0
+    var i: Int = 1
+    while i < track.count:
+        if track.times[i] > time:
+            key_a = i - 1
+            i = track.count + 1
+        i = i + 1
+    if time >= track.times[track.count - 1]:
+        key_a = track.count - 2
+    let key_b: Int = key_a + 1
+    if key_b >= track.count:
+        return track.values[key_a * track.value_stride]
+    let t_local: Float = (time - track.times[key_a]) / (track.times[key_b] - track.times[key_a])
+    let t_clamped: Float = math_clamp(t_local, 0.0, 1.0)
+    let val_a: Float = track.values[key_a * track.value_stride]
+    let val_b: Float = track.values[key_b * track.value_stride]
+    return lerp_scalar(val_a, val_b, t_clamped)
+
+// ============================================================================
+//  CONVERGE — Multi-Strategy Interpolation (using basic types for verify)
+// ============================================================================
+
+converge interpolate_value(a: Float, b: Float, t: Float) -> Float:
+    spec reference:
+        return lerp_scalar(a, b, t)
+    fast step_lane:
+        if t < 1.0:
+            return a
+        return b
+    fast cubic_lane:
+        let t2: Float = t * t
+        let t3: Float = t2 * t
+        return (2.0 * t3 - 3.0 * t2 + 1.0) * a + (-2.0 * t3 + 3.0 * t2) * b
+    verify random(8)
+
+// ============================================================================
+//  ACTOR — AnimationMixer
+// ============================================================================
+
+actor AnimationMixer:
+    state actions: [AnimationActionState] = []
+    state clip_database: [AnimationClip] = []
+    state time: Float = 0.0
+    state time_scale: Float = 1.0
+    state epoch: Int = 0
+
+    on PlayClip(reply_to: P, clip_name: String):
+        var found: Bool = false
+        var clip_index: Int = 0
+        while clip_index < len(self.clip_database):
+            if self.clip_database[clip_index].name == clip_name:
+                found = true
+                clip_index = len(self.clip_database) + 1
+            clip_index = clip_index + 1
+        if found:
+            let action: AnimationActionState = AnimationActionState {
+                clip: self.clip_database[clip_index],
+                target_node_id: clip_index,
+                weight: 1.0,
+                speed: 1.0,
+                playing: true,
+                paused: false,
+                fade_in_duration: 0.0,
+                fade_out_duration: 0.0,
+                fade_target_id: 0,
+                epoch: 0
+            }
+            self.actions = [action]
+            self.epoch = self.epoch + 1
+            let _result: Int = play_action(self.actions[0], 1.0)
+            send reply_to.Reply(value = self.epoch)
+        else:
+            send reply_to.Reply(value = 0)
+
+    on Crossfade(reply_to: P, from_id: Int, to_clip_name: String, duration: Float):
+        var target_idx: Int = 0
+        while target_idx < len(self.clip_database):
+            if self.clip_database[target_idx].name == to_clip_name:
+                let new_action: AnimationActionState = AnimationActionState {
+                    clip: self.clip_database[target_idx],
+                    target_node_id: target_idx,
+                    weight: 0.0,
+                    speed: 1.0,
+                    playing: true,
+                    paused: false,
+                    fade_in_duration: duration,
+                    fade_out_duration: 0.0,
+                    fade_target_id: 0,
+                    epoch: 0
+                }
+                self.actions = [new_action]
+                self.epoch = self.epoch + 1
+                target_idx = len(self.clip_database) + 1
+            target_idx = target_idx + 1
+        send reply_to.Reply(value = self.epoch)
+
+    on StopAll(reply_to: P):
+        self.actions = []
+        self.epoch = self.epoch + 1
+        send reply_to.Reply(value = 0)
+
+    on GetStats(reply_to: P):
+        let action_count: Int = len(self.actions)
+        let clip_count: Int = len(self.clip_database)
+        let packed: Int = action_count + clip_count * 65536
+        send reply_to.Reply(value = packed)
+
+    on Update(reply_to: P, dt_ms: Int):
+        let dt: Float = dt_ms
+        self.time = self.time + self.time_scale * dt * 0.001
+        var i: Int = 0
+        while i < len(self.actions):
+            let action: AnimationActionState = self.actions[i]
+            if action.playing == false and action.paused == false:
+                i = i + 1
+                continue
+            if action.paused == false:
+                let action_dt: Float = dt * 0.001 * action.speed
+                action.time = action.time + action_dt
+                if action.time > action.clip.duration:
+                    if action.loop_mode:
+                        action.time = action.time % action.clip.duration
+                    else:
+                        action.playing = false
+                        let _stop: Int = stop_action(action)
+                action.epoch = action.epoch + 1
+            i = i + 1
+        self.epoch = self.epoch + 1
+        send reply_to.Reply(value = len(self.actions))
+
+// ============================================================================
+//  PULSE — Animation Tick Driver
+// ============================================================================
+
+pulse animation_tick every 16ms jitter 2ms:
+    let dt: Int = pulse_dt_ms
+    if dt < 1:
+        dt = 16
+    let mixer_id: Int = actor_registry_lookup("animation-mixer")
+    if mixer_id != actor_invalid_id():
+        let _result: Int = actor_send(mixer_id, "Update", str(dt))
+
+// ============================================================================
+//  INITIALIZATION
+// ============================================================================
+
+fn spawn_animator() -> Int:
+    let mixer_id: Int = actor_spawn("animation-mixer", "{\"time\":0.0}")
+    let _reg: Int = actor_registry_register("animation-mixer", mixer_id)
+    return mixer_id
